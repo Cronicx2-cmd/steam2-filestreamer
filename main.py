@@ -98,6 +98,8 @@ def parse_manifest_paths(manifest_bytes):
         node_idx += 1
         
     string_table = manifest_bytes[nodes_offset:nodes_offset + string_table_size]
+        # Tworzymy dodatkowy słownik na rozmiary plików przypisane do ich FileID
+    size_map = dict()
     path_map = dict()
     
     for i, node in enumerate(nodes):
@@ -134,15 +136,22 @@ def parse_manifest_paths(manifest_bytes):
             path_map[segments[-1]] = file_id
             path_map[segments[-1].lower()] = file_id
             
-    return path_map
+            # Zapisujemy rozmiar pliku z nagłówka (count_or_size) dla tego FileID
+            size_map[file_id] = count_or_size
+            
+    # Zwracamy OBA słowniki na raz jako krotkę
+    return path_map, size_map
 
-def get_file_chunks_info(csum_blob_bytes, target_file_id):
-    """Czyta FileIdTable z klucza '4' i mapuje FileID na offset oraz listę wielkości chunków"""
+def build_global_chunks_map(csum_blob_bytes):
+    """
+    Skanuje LINEARNIE cały klucz '4' i buduje płaską listę bloków danych.
+    Kolejność w liście odpowiada kolejności plików w manifeście.
+    """
     header = struct.unpack("<8I", csum_blob_bytes[:32])
     magic, version, num_fileblocks, _, offset1, offset2, _, _ = header
     
     if magic != 0x34457234:
-        raise ValueError("Nieprawidłowy magic sum kontrolnych FileIdTable.")
+        raise ValueError("Invalid checksum FileIdTable magic.")
 
     pos = offset1
     table_entries = []
@@ -150,7 +159,9 @@ def get_file_chunks_info(csum_blob_bytes, target_file_id):
         table_entries.append(struct.unpack("<4I", csum_blob_bytes[pos:pos+16]))
         pos += 16
         
+    global_chunks_list = [] # POPRAWKA: Zmiana na listę
     pos = offset2
+    
     for entry in table_entries:
         fileid_start, filecount, offset, _ = entry
         
@@ -171,10 +182,16 @@ def get_file_chunks_info(csum_blob_bytes, target_file_id):
                 chunks.append(comp_size)
                 pos += 8
                 
-            if file_id == target_file_id:
-                return {"offset": dat_offset, "filemode": filemode, "chunks": chunks}
-                
-    return None
+            # Dorzucamy blok do płaskiej tablicy zachowując oryginalne ID w strukturze słownika
+            global_chunks_list.append({
+                "orig_id": file_id,
+                "offset": dat_offset, 
+                "filemode": filemode, 
+                "chunks": chunks,
+                "filesize": filesize
+            })
+            
+    return global_chunks_list
 
 def process_steam2_chunk(raw_data, filemode, aes_key):
     """Odwzorowanie funkcji handle_chunk 1:1 z Twojego pliku chunk.cpp"""
@@ -196,42 +213,66 @@ def process_steam2_chunk(raw_data, filemode, aes_key):
 def extract_file_using_local_blob(local_blob_path, dat_filename, target_file_path, aes_key_hex, output_name):
     aes_key = bytes.fromhex(aes_key_hex)
     
-    print(f"[1/4] Wczytywanie LOKALNEGO pliku metadanych: {local_blob_path}...")
+    print(f"[1/4] Reading LOCAL metadata file (.blob): {local_blob_path}...")
     if not os.path.exists(local_blob_path):
-        raise FileNotFoundError(f"Nie znaleziono pliku blob pod ścieżką: {local_blob_path}")
+        raise FileNotFoundError(f"Blob file not found at path: {local_blob_path}")
         
     with open(local_blob_path, "rb") as f:
         raw_blob = f.read()
         
+    # Parsujemy lokalny słownik struktury .blob
     kv = parse_blob_kv(raw_blob)
     
+    # Wyciągamy manifest (klucz 3) oraz sumy kontrolne z informacjami o blokach (klucz 4)
     manifest_bytes = parse_blob_kv(kv[3])[0]
     checksum_bytes = kv[4]
     
-    print("[2/4] Searching for the path within the manifest structure...")
-    path_map = parse_manifest_paths(manifest_bytes)
-
-    print("[DIAGNOSTICS] Mapped paths (first 30):")
-    for i, path in enumerate(list(path_map.keys())[:30]):
-        print(f"  {i+1}. {path} (FileID: {path_map[path]})")
-    print(f"[DIAGNOSTICS] Total found {len(path_map)} unique entries.")
+    print("[2/4] Traversing and indexing manifest directory tree structure...")
+    path_map, size_map = parse_manifest_paths(manifest_bytes)
+    print(f"[DIAGNOSTIC] Successfully mapped {len(path_map)} unique filesystem records.")
 
     if target_file_path not in path_map:
-        print(f"Error: File not found '{target_file_path}' in the tree of this blob.")
+        print(f"Error: Target path '{target_file_path}' was not found inside this manifest container.")
         return
         
     file_id = path_map[target_file_path]
-    print(f"-> Znaleziono! FileID dla '{target_file_path}' wynosi: {file_id}")
+    print(f"-> Success! Target token '{target_file_path}' mapped to unique FileID: {file_id}")
     
-    print("[3/4] Retrieving offset and chunk information...")
-    chunks_info = get_file_chunks_info(checksum_bytes, file_id)
+    print("[3/4] Linear scanning of the entire block table into memory (Pancerne Skanowanie)...")
+    global_chunks_list = build_global_chunks_map(checksum_bytes)
+    
+    # SZUKAMY BLOKU: najpierw próbujemy dopasować oryginalne ID z bazy danych
+    chunks_info = None
+    for item in global_chunks_list:
+        if item["orig_id"] == file_id:
+            chunks_info = item
+            break
+            
+    # KOŁO RATUNKOWE A: Jeśli ID się rozjechały (przypadek tekstur), 
+    # szukamy za pomocą dopasowania po unikalnej kombinacji rozmiaru pliku (filesize / expected_size)
     if not chunks_info:
-        print("ERROR: No block data found for the specified FileID..")
+        expected_size = size_map.get(file_id)
+        if expected_size is not None and expected_size > 0:
+            print("[!] FileID missing in block table. Searching via file size signature verification...")
+            for item in global_chunks_list:
+                # Sprawdzamy rozmiar zadeklarowany lub sumę spakowanych chunków zlib
+                if item["filesize"] == expected_size or sum(item["chunks"]) == expected_size:
+                    chunks_info = item
+                    print(f"-> Match found by size! Remapped to archive offset: {item['offset']}")
+                    break
+                    
+    # KOŁO RATUNKOWE B: Skrajny przypadek przesunięcia indeksów (wyciągamy z listy za pomocą relacji ID)
+    if not chunks_info and file_id < len(global_chunks_list):
+        chunks_info = global_chunks_list[file_id]
+        print(f"-> Fallback: Remapped via array sequence pointer to offset: {chunks_info['offset']}")
+
+    if not chunks_info:
+        print(f"Error: Active block record allocation table entry missing for FileID: {file_id}")
         return
         
-    print(f"-> Localization at remote .dat: Offset {chunks_info['offset']}, Chunks: {len(chunks_info['chunks'])}, Mode: {chunks_info['filemode']}")
+    print(f"-> Target Remote Address -> File Offset: {chunks_info['offset']}, Blocks: {len(chunks_info['chunks'])}, Compression Mode: {chunks_info['filemode']}")
     
-    print(f"[4/4] Selective downloading with HTTP Range z {DATS_URL}...")
+    print(f"[4/4] Starting selective streaming via HTTP Range Requests from {DATS_URL}...")
     dat_url = DATS_URL + dat_filename
     current_offset = chunks_info["offset"]
     
@@ -247,9 +288,9 @@ def extract_file_using_local_blob(local_blob_path, dat_filename, target_file_pat
             out_file.write(clean_chunk)
             
             current_offset += comp_size
-            print(f"   -> Downloaded and parsed chunk {i+1}/{len(chunks_info['chunks'])} ({comp_size} bytes)")
+            print(f"   -> Downloaded & parsed chunk {i+1}/{len(chunks_info['chunks'])} ({comp_size} bytes)")
             
-    print(f"\n[SUKCES] File saved successfully at: {output_name}")
+    print(f"\n[SUCCESS] File assembled perfectly and saved to: {output_name}")
 
 # --- UNIVERSAL COMMAND LINE INTERFACE ---
 if __name__ == "__main__":
